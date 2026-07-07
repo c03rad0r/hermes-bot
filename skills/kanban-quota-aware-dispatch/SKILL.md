@@ -46,7 +46,32 @@ This means:
 - **Routine development** → glm-4.5 most of the time (80% target)
 - **Cleanup/refactor tickets** → queue for weekends or plentiful quota windows
 
-## Implementation Files
+## Dynamic Thresholds (Adaptive Model Tuner)
+
+Thresholds are NOT static — they recalibrate weekly from historic Kalman data
+to maintain the 10/80/10 target mix:
+
+- **~10% premium (glm-5.2)** — when hours_left > P90 (friend 5-hour ~195h)
+- **~80% standard (glm-4.5 variants)** — between P10 and P90
+- **~10% economy (flash/air)** — when hours_left < P10 (friend 5-hour ~1h)
+
+The `adaptive_model_tuner.py` script reads `zai_usage.db` Kalman samples,
+computes percentile thresholds, and writes `model_tier_thresholds.json`.
+A weekly cron (`0 3 * * 0`) runs this automatically.
+
+### Current Thresholds
+
+```bash
+cat ~/.hermes/bot/model_tier_thresholds.json
+```
+
+### Manual Tuning
+
+```bash
+python3 ~/.hermes/bot/adaptive_model_tuner.py --stats   # view distribution
+python3 ~/.hermes/bot/adaptive_model_tuner.py --dry-run  # preview changes
+python3 ~/.hermes/bot/adaptive_model_tuner.py            # apply
+``` Files
 
 ### `~/.hermes/bot/model_tier_router.py`
 CLI + proxy import. Two entry points:
