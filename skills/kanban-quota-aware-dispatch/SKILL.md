@@ -1,237 +1,129 @@
 ---
 name: kanban-quota-aware-dispatch
-description: "Route kanban tasks to appropriate model tiers based on Kalman-predicted quota headroom, peak-hour windows, and task complexity metadata. Keeps workers on the local proxy (no PPQ fallback) by downgrading models instead."
-version: 1.0.0
+description: "Route kanban workers to cheaper GLM models during peak hours or tight quota, driven by Kalman filter predictions. 10/80/10 target distribution (heavy/mid/lower). Dynamic percentile thresholds auto-adjusted from usage history. Urgency-aware dispatch — urgent tasks always flow, low tasks queue for off-peak."
+version: 3.0.0
 author: Hermes Agent
-license: MIT
-platforms: [linux]
-metadata:
-  hermes:
-    tags: [kanban, quota, dispatch, kalman, model-selection, scheduling]
-    related_skills: [zai-proxy-management, kalman-convergence-check, kanban-worker-management]
+tags: [kanban, dispatch, quota, kalman, model-tiering, urgency, peak-hours, dynamic-thresholds]
 ---
 
-# Quota-Aware Kanban Dispatch
+# Quota-Aware Kanban Dispatch — v3
 
-## Problem
+## Target Distribution
 
-Workers all use `glm-5.2` regardless of task complexity. During peak hours
-(06:00–10:00 UTC) or when quota is tight this:
-- Burns 3× quota per token on heavy models during peak
-- Forces PPQ fallback (real money) when z.ai keys exhaust
-- Blocks dispatch entirely when both keys hit thresholds
+From historical analysis of 1584 Kalman samples (friend/5-hour window):
 
-## Solution: Four-Levers
+| Tier | Model | Target | 90th %ile threshold | Best for |
+|------|-------|--------|---------------------|----------|
+| `heavy` | glm-5.2 | **10%** | `hours_left > 10.6h` | Architecture, debugging, complex reasoning |
+| `mid` | glm-4.5 | **80%** | `0.1h < hours_left ≤ 10.6h` | Refactoring, coding, most tasks |
+| `air` | glm-4.5-air | ~5% | `hours_left ≤ 0.1h` | Boilerplate |
+| `flash` | glm-4.5-flash | ~5% | `hours_left ≤ 0.1h` | Formatting, simple edits |
 
-### 1. Model Tiering (price relative to glm-5.2)
+**Peak hours (06:00-10:00 UTC):** cap at `air` regardless. glm-5.2 costs 3× during peak.
 
-| Tier | Model | Relative cost | Peak cost | Best for |
-|------|-------|--------------|-----------|----------|
-| `flash` | glm-4.5-flash | 0.11× | 0.33× | Formatting, simple edits, grep/search, test runs |
-| `air` | glm-4.5-air | 0.22× | 0.66× | Boilerplate, mid-complexity |
-| `mid` | glm-4.5 | 0.33× | 1.0× | Refactoring, moderate coding |
-| `heavy` | glm-5.2 | 1.0× | 3.0× | Complex reasoning, architecture, debugging |
+## Dynamic Thresholds
 
-A `flash` task during peak costs **0.33×** vs `heavy` at **3.0×** = **9× savings**.
+Thresholds auto-adjust every 1h via `threshold_tracker.py` (PID controller reading `model_decisions` from `zai_usage.db`):
 
-### 2. Quota State (from Kalman)
+- If heavy usage > 13% → raise `heavy_min_hours` 5%
+- If heavy usage < 7% → lower `heavy_min_hours` 5%  
+- Same logic for lower tiers
+- Dead zone: ±3% to prevent oscillation
+- Min: 4h, Max: 48h
 
-The Kalman filter (`burn_predictor.py`) outputs `hours_left`, `will_exhaust`,
-`burn_rate_tph`. Map to quota state:
+## Urgency-Aware Dispatch
 
-| State | Condition | Allowed tiers |
-|-------|-----------|---------------|
-| `PLENTYFUL` | `hours_left > 48` AND `!will_exhaust` | All |
-| `MODERATE` | `hours_left > 12` | `flash`, `air`, `mid` |
-| `TIGHT` | `hours_left > 2` | `flash`, `air` |
-| `CRITICAL` | `hours_left < 2` OR `will_exhaust` | `flash` only |
+Each kanban task carries `urgency` alongside `model_tier`:
 
-Query via:
+| Urgency | Behavior |
+|---------|----------|
+| `urgent` | Always dispatched regardless of quota/peak. Peak cap removed. Uses best available tier. |
+| `normal` | Standard dispatch rules (default). Blocked in CRITICAL state. |
+| `low` | Only dispatched in PLENTYFUL state (hours_left > 10h). Queued for off-peak otherwise. |
+
+This means:
+- **Urgent production issues** → always get glm-5.2 if needed
+- **Routine development** → glm-4.5 most of the time (80% target)
+- **Cleanup/refactor tickets** → queue for weekends or plentiful quota windows
+
+## Implementation Files
+
+### `~/.hermes/bot/model_tier_router.py`
+CLI + proxy import. Two entry points:
+
+**CLI (dispatcher calls this):**
 ```bash
-curl -s localhost:9099/quota | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-# Get the active key's headroom
-for key in ['ours', 'friend']:
-    k = d.get(key, {})
-    if not k.get('locked', True):
-        print(f'active_key={key}')
-        for w in k.get('windows', []):
-            print(f"  {w['name']}: {w.get('used_pct','?')}%")
-        break
-"
+# Standard dispatch (80% case — glm-4.5)
+python3 model_tier_router.py --task-tier mid
+# {"tier": "mid", "model": "glm-4.5", "reason": "quota=MODERATE_off_peak_urg=normal", ...}
+
+# Urgent task during peak — overrides cap
+python3 model_tier_router.py --task-tier heavy --urgency urgent
+# {"tier": "heavy", "model": "glm-5.2", "reason": ..., "hours_left": 4.2}
+
+# Low urgency in tight quota — deferred
+python3 model_tier_router.py --task-tier mid --urgency low --quota-state MODERATE
+# {"tier": null, "reason": "urgency=low blocked in MODERATE"}
+
+# Show current thresholds
+python3 model_tier_router.py --stats
 ```
 
-### 3. Peak Hours
+**Proxy import (`compute_tier(chosen_key, tier_hint)`):**
+Called by `zai_proxy.py` on every proxied request. Returns `model: None` when no downgrade needed.
 
-**06:00–10:00 UTC** — glm-5.2 burns 3× quota.
-Rule: during peak, cap max tier to `air` regardless of quota state.
+### `~/.hermes/bot/zai_proxy.py`
+X-Model-Tier header rewrite. When header present, rewrites body's `model` field.
 
-Check with:
-```bash
-HOUR=$(date -u +%H)
-if [ "$HOUR" -ge 6 ] && [ "$HOUR" -lt 10 ]; then echo "PEAK"; else echo "OFF_PEAK"; fi
-```
+### `~/.hermes/bot/quota_gate.py`
+Preflight check before spawning workers. Returns exit code 0 (GO) or 1 (BLOCKED). Blocks only when both keys truly exhausted (used_pct >= 95%).
 
-### 4. Kanban Task Model Tier Metadata
+### `~/.hermes/bot/threshold_tracker.py`
+PID controller. Reads `model_decisions` table, adjusts thresholds toward 10/80/10 target. Cronned every 1h.
 
-Every kanban task SHOULD carry a `model_tier` field:
+## Kanban Task Metadata
 
-| Value | Meaning | Example tasks |
-|-------|---------|--------------|
-| `flash` | Default. Simple/mechanical. | File moves, grep, test runs, formatting |
-| `air` | Mid complexity. | Boilerplate generation, simple refactors |
-| `mid` | Moderate. | Feature implementation, moderate debugging |
-| `heavy` | Complex reasoning. | Architecture, code review, design docs |
-
-When omitted, dispatcher assumes `flash` (conservative default).
-
-## Build Status
-
-All 5 layers built and pushed to `github.com/c03rad0r/hermes-bot.git` (commit `cb346eb`):
-
-| Layer | File | Status |
-|-------|------|--------|
-| 0. Quota thresholds | `zai_proxy.py` (LOCK_THRESHOLDS) | Fixed — friend weekly 40%→80% |
-| 1. Model tier router | `scripts/model_tier_router.py` | ✅ Built — reads :9099/quota, outputs `{tier, model, quota_state, peak_hours}` |
-| 2. Proxy rewrite | `scripts/zai_proxy.py` | ✅ Built — X-Model-Tier header → model rewrite |
-| 3. Dispatch gate | `scripts/dispatch-quota-gate.py` | ✅ Built — wired into adaptive-dispatch-daemon.sh |
-| 4. Off-peak cron | Cron `off-peak-heavy-dispatch` at `1 10 * * *` | ✅ Created — fires daily at 10:01 UTC |
-
-### How to use
-
-```bash
-# Check quota state and recommended tier
-python3 ~/.hermes/bot/model_tier_router.py
-# → {"tier": "flash", "model": "glm-4.5-flash", "quota_state": "CRITICAL", "peak_hours": true}
-
-# Test proxy header rewrite
-curl -s -X POST localhost:9099/v1/chat/completions \
-  -H "X-Model-Tier: flash" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
-# Response will actually use glm-4.5-flash
-
-# Check dispatch gate
-python3 ~/.hermes/profiles/manager/scripts/dispatch-quota-gate.py
-# → {"allowed": false, "tier": "flash", "quota_state": "CRITICAL", ...}
-```
-
-### Layer 0: Quota Thresholds (DONE 2026-07-07)
-
-Friend key weekly threshold raised from 40% → 80% to prevent false dispatch blocking:
-
-```yaml
-# Before (blocked dispatch at 61% friend weekly):
-friend: weekly=40  # → friend_pause=True
-# After (flows until 80%):
-friend: weekly=80  # → friend_pause only past 80%
-```
-
-This was the actual bottleneck — friend key was at 61% weekly, threshold was 40%, so dispatch was blocked. Fixed now.
-
-### Layer 1: Proxy — X-Model-Tier header rewrite
-
-The proxy at localhost:9099 should accept an `X-Model-Tier` HTTP header.
-When present, the proxy picks the cheapest model in that tier that the
-current quota state permits, instead of forwarding the client's `model`
-field verbatim.
-
-```python
-# Pseudo-code for proxy rewrite:
-MODEL_TIER_MAP = {
-    'flash': ['glm-4.5-flash'],
-    'air':   ['glm-4.5-air', 'glm-4.5-flash'],
-    'mid':   ['glm-4.5', 'glm-4.5-air', 'glm-4.5-flash'],
-    'heavy': ['glm-5.2', 'glm-4.5', 'glm-4.5-air', 'glm-4.5-flash'],
+```json
+{
+  "id": "t_abc123",
+  "title": "Fix race condition in payment channel",
+  "model_tier": "heavy",
+  "urgency": "urgent",
+  "status": "ready"
 }
-
-def pick_model(tier: str, quota_state: str) -> str:
-    candidates = MODEL_TIER_MAP[tier]
-    for model in candidates:
-        if is_allowed(model, quota_state):
-            return model
-    return candidates[-1]  # safe fallback
 ```
 
-This is already designed (see `zai-proxy-management` → `references/tiered-model-selection-design.md`)
-but NOT YET IMPLEMENTED.
-
-### Layer 2: Kalman — Quota state endpoint
-
-Add a `quota_state` method to `burn_predictor.py` that returns the
-enum from §2 above. Make it callable from the proxy and from dispatch
-scripts.
-
-```bash
-python3 ~/.hermes/bot/burn_predictor.py --quota-state
-# Returns: "TIGHT" or "PLENTYFUL"
-```
-
-### Layer 3: Dispatcher — Smart routing
-
-Before spawning a worker, the kanban dispatcher:
-
-1. Reads the task's `model_tier` (default: `flash`)
-2. Checks `peak_hours` → if peak, cap max tier to `air`
-3. Queries Kalman `quota_state` → determines allowed tiers
-4. Picks the cheapest allowed tier that meets the task's required tier
-5. Passes `model_tier` or a specific model down to the worker
-
-```python
-# Pseudo-code for dispatcher:
-def select_model_for_task(task, quota_state, peak_hours):
-    required_tier = task.get('model_tier', 'flash')
-    max_tier = 'air' if peak_hours else 'heavy'
-    allowed = get_allowed_tiers(quota_state)
-    selected = max(allowed & {required_tier, max_tier})  # pick cheapest that fits
-    return selected
-```
-
-### Layer 4: Cron — Off-peak scheduling
-
-Tasks with `model_tier: heavy` should NOT be dispatched during peak
-hours or when quota is tight. Instead, they get a `scheduled_at` field
-and a cron picks them up at the next off-peak window.
-
-```bash
-# Example cron schedule for heavy tasks:
-# 0 10 * * *  — dispatch any queued heavy tasks (just after peak ends)
-# 0 22 * * *  — dispatch heavy tasks in cheap evening hours
-```
+Recommended tiers by task type:
+- `flash` + `normal`: typo fixes, CI tweaks, formatting
+- `air` + `normal`: config changes, simple documentation
+- `mid` + `normal`: refactoring, endpoints, tests (80% of tasks)
+- `mid` + `low`: backlog cleanup, tech debt (queue for off-peak)
+- `heavy` + `urgent`: production incidents, race conditions
+- `heavy` + `normal`: architecture, protocol design
 
 ## Verification
 
 ```bash
-# Check quota state
-python3 ~/.hermes/bot/burn_predictor.py --quota-state
+# Show current thresholds + historical data
+python3 ~/.hermes/bot/model_tier_router.py --stats
 
-# Check peak hours
-date -u +%H  # if 06-10 → peak
+# Test dispatch gate
+python3 ~/.hermes/bot/quota_gate.py -v
 
-# Check what model a task would get
-./dispatch_simulate.py --task model_tier=mid
+# Test tier selection
+python3 ~/.hermes/bot/model_tier_router.py --task-tier mid --urgency urgent
 
-# Test proxy header rewrite
+# Check proxy rewrite
 curl -s -X POST localhost:9099/v1/chat/completions \
   -H "X-Model-Tier: flash" \
   -H "Content-Type: application/json" \
   -d '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
-# Should actually use glm-4.5-flash
 ```
 
-## Pitfalls
+## Related
 
-- **Don't over-engineer model tier assignment.** Most tasks are `flash`.
-  Only tasks that genuinely need reasoning get `heavy`. Start conservative.
-- **Kalman convergence is unhealthy** as of 2026-07-07 (MAPE ~118M%).
-  The quota_state heuristic works with any Kalman output — fall back to
-  `hours_left` from the proxy's raw quota data when Kalman is unavailable.
-- **Two-layer retry problem still applies.** The proxy retries 50× but
-  Hermes agent has `api_max_retries`. Bumping to 15+ helped. With
-  model downgrade, 429s should be rarer.
-- **Model tier is a hint, not a hard constraint.** A `flash` task CAN run on
-  glm-5.2 if quota is plentiful — no harm done. The tier prevents
-  expensive models when budget is tight, not the reverse.
-- **Keep the skill in sync** with `zai-proxy-management` skill — if the
-  proxy's model list changes, update both.
+- `tollgate-rs/docs/design/infra/quota-aware-dispatch.md` — full design doc
+- `zai-proxy-management` skill — proxy architecture
+- `kalman-convergence-check` skill — Kalman filter health
+- `kanban-worker-management` skill — dispatch lifecycle
+- `references/locked-vs-exhausted.md` — two-layer quota model
