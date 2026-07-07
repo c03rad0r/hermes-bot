@@ -86,7 +86,49 @@ Every kanban task SHOULD carry a `model_tier` field:
 
 When omitted, dispatcher assumes `flash` (conservative default).
 
-## Implementation
+## Build Status
+
+All 5 layers built and pushed to `github.com/c03rad0r/hermes-bot.git` (commit `cb346eb`):
+
+| Layer | File | Status |
+|-------|------|--------|
+| 0. Quota thresholds | `zai_proxy.py` (LOCK_THRESHOLDS) | Fixed — friend weekly 40%→80% |
+| 1. Model tier router | `scripts/model_tier_router.py` | ✅ Built — reads :9099/quota, outputs `{tier, model, quota_state, peak_hours}` |
+| 2. Proxy rewrite | `scripts/zai_proxy.py` | ✅ Built — X-Model-Tier header → model rewrite |
+| 3. Dispatch gate | `scripts/dispatch-quota-gate.py` | ✅ Built — wired into adaptive-dispatch-daemon.sh |
+| 4. Off-peak cron | Cron `off-peak-heavy-dispatch` at `1 10 * * *` | ✅ Created — fires daily at 10:01 UTC |
+
+### How to use
+
+```bash
+# Check quota state and recommended tier
+python3 ~/.hermes/bot/model_tier_router.py
+# → {"tier": "flash", "model": "glm-4.5-flash", "quota_state": "CRITICAL", "peak_hours": true}
+
+# Test proxy header rewrite
+curl -s -X POST localhost:9099/v1/chat/completions \
+  -H "X-Model-Tier: flash" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
+# Response will actually use glm-4.5-flash
+
+# Check dispatch gate
+python3 ~/.hermes/profiles/manager/scripts/dispatch-quota-gate.py
+# → {"allowed": false, "tier": "flash", "quota_state": "CRITICAL", ...}
+```
+
+### Layer 0: Quota Thresholds (DONE 2026-07-07)
+
+Friend key weekly threshold raised from 40% → 80% to prevent false dispatch blocking:
+
+```yaml
+# Before (blocked dispatch at 61% friend weekly):
+friend: weekly=40  # → friend_pause=True
+# After (flows until 80%):
+friend: weekly=80  # → friend_pause only past 80%
+```
+
+This was the actual bottleneck — friend key was at 61% weekly, threshold was 40%, so dispatch was blocked. Fixed now.
 
 ### Layer 1: Proxy — X-Model-Tier header rewrite
 
